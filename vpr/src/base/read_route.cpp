@@ -50,7 +50,7 @@ static void process_global_blocks(std::ifstream& fp, ClusterNetId inet, const ch
 static void format_coordinates(int& x, int& y, std::string coord, ClusterNetId net, const char* filename, const int lineno);
 static void format_pin_info(std::string& pb_name, std::string& port_name, int& pb_pin_num, std::string input);
 static std::string format_name(std::string name);
-static bool check_dangling_branch(int x1, int y1, int x2, int y2, int prev_x1, int prev_y1, int prev_x2, int prev_y2, std::string curr_type, std::string prev_type);
+static bool check_rr_graph_connectivity(RRNodeId prev_node, RRNodeId node);
 
 /*************Global Functions****************************/
 bool read_route(const char* route_file, const t_router_opts& router_opts, bool verify_file_digests) {
@@ -209,10 +209,10 @@ static void process_nodes(std::ifstream& fp, ClusterNetId inet, const char* file
     std::streampos oldpos = fp.tellg();
     int inode, x, y, x2, y2, ptc, switch_id, offset;
     std::string prev_type;
-    int prev_x = -1, prev_y = -1, prev_x2 = -1, prev_y2 = -1;
     int node_count = 0;
     std::string input;
     std::vector<std::string> tokens;
+    RRNodeId prev_node(-1);
 
     /*Walk through every line that begins with Node:*/
     while (std::getline(fp, input)) {
@@ -264,15 +264,11 @@ static void process_nodes(std::ifstream& fp, ClusterNetId inet, const char* file
                 offset = 2;
 
                 /* Check for connectivity, this throws an exception when a dangling net is encountered in the routing file */
-                bool dangling = check_dangling_branch(x, y, x2, y2, prev_x, prev_y, prev_x2, prev_y2, tokens[2], prev_type);
-                prev_x = x;
-                prev_y = y;
-                prev_x2 = x2;
-                prev_y2 = y2;
-                prev_type = tokens[2];
-                if(dangling) {
-                    vpr_throw(VPR_ERROR_ROUTE, filename, lineno, "Dangling branch at net %lu: %s", inet, input.c_str());
+                bool legal_node = check_rr_graph_connectivity(prev_node, node.id());
+                if (!legal_node) {
+                    vpr_throw(VPR_ERROR_ROUTE, filename, lineno, "Dangling branch at net %lu, nodes %d -> %d: %s", inet, prev_node, inode, input.c_str());
                 }
+                prev_node = node.id();
             } else {
                 if (node.xlow() != x || node.xhigh() != x || node.yhigh() != y || node.ylow() != y) {
                     vpr_throw(VPR_ERROR_ROUTE, filename, lineno,
@@ -280,15 +276,12 @@ static void process_nodes(std::ifstream& fp, ClusterNetId inet, const char* file
                 }
                 offset = 0;
 
-                bool dangling = check_dangling_branch(x, y, x, y, prev_x, prev_y, prev_x2, prev_y2, tokens[2], prev_type);
-                prev_x = x;
-                prev_y = y;
-                prev_x2 = x;
-                prev_y2 = y;
-                prev_type = tokens[2];
-                if(dangling) {
-                    vpr_throw(VPR_ERROR_ROUTE, filename, lineno, "Dangling branch in specified route file at line %lu: %s", inet, input.c_str());
+                bool legal_node = check_rr_graph_connectivity(prev_node, node.id());
+                prev_node = node.id();
+                if (!legal_node) {
+                    vpr_throw(VPR_ERROR_ROUTE, filename, lineno, "Dangling branch at net %lu, nodes %d -> %d: %s", inet, prev_node, inode, input.c_str());
                 }
+                prev_node = node.id();
             }
 
             /* Verify types and ptc*/
@@ -470,77 +463,40 @@ static std::string format_name(std::string name) {
     }
 }
 
-/* Check if there is a discontinuity in the trace
- * There is more to this but I'll test thoroughly, my priority is not to break it */
-static bool check_dangling_branch(int x1, int y1, int x2, int y2, int prev_x1, int prev_y1, int prev_x2, int prev_y2, std::string curr_type, std::string prev_type) {
-    
-    if(prev_x1 == -1) return false;
-    // Check chanx connections on a case by case basis
-    if(prev_type == "CHANX") {
-         
-        if(curr_type == "CHANX") {
-            // Check if the coordinates are within 1 of each other, representing a connection
-            if((prev_x2 != (x1 - 1)) && (prev_x1 != (x2 + 1))) {
-                return true;
-            } else {
-                // Ensure on same vertical coordinate
-                if(prev_y1 != y1) {
-                    return true;
-                }
-            }
-        } else if(curr_type == "CHANY") {
-            // Y coordinate should be within 1
-            int dy1 = (prev_y1) - y1;
-            int dy2 = (prev_y1) - y2;
+/* Check for a discontinuity in the trace looking at the rr_graph
+ * This is a check to ensure illegal dangling branches are caught before the program moves further
+ * @returns false if there is a discontinuity */
+static bool check_rr_graph_connectivity(RRNodeId prev_node, RRNodeId node) {
 
-            if(!(dy1 <= 1 && dy1 >= -1) && !(dy2 <= 1 && dy2 >= -1)) {
-                // Y coordinate not within 1, this means it's not possible possible for a connection
-                return true;
-            } else {
-                // Also check if it's within the x coordinates
-                if(!(x1 >= (prev_x1 - 1)) || !(x1 <= (prev_x2 + 1))) {
-                    return true;
-                }
-            }
+    // Check if its the first node of the series
+    if (prev_node == RRNodeId(-1)) return true;
+
+    // Check if the nodes are the same, which is illegal
+    if (prev_node == node) return false;
+
+    auto& device_ctx = g_vpr_ctx.device();
+    const auto& rr_graph = device_ctx.rr_nodes;
+    const auto& switch_info = device_ctx.rr_switch_inf;
+
+    // If it's starting a new sub branch this is ok
+    if (rr_graph.node_type(prev_node) == SINK) return true;
+
+    for (RREdgeId edge : rr_graph.edge_range(prev_node)) {
+
+        //If the sink node is reachable by previous node return true
+        if (rr_graph.edge_sink_node(edge) == node) {
+            return true;
         }
+
+        // If there are any non-configurable branches return true
+        short edge_switch = rr_graph.edge_switch(edge);
+        if (!(switch_info[edge_switch].configurable())) return true; 
     }
 
-    if(prev_type == "CHANY") {
-        if(curr_type == "CHANY") {
-            if((prev_y2 != (y1 - 1)) && (prev_y1 != (y2 + 1))) {
-                return true;
-            } else {
-                if(prev_x1 != x1) {
-                    return true;
-                }
-            }
-        } else if(curr_type == "CHANX") {
-            // X coordinates should be within 1
-            int dx1 = prev_x1 - x1;
-            int dx2 = prev_x1 - x2;
-            
-            if(!(dx1 <= 1 && dx1 >= -1) && !(dx2 <= 1 && dx2 >= -1)) {
-                // X coordinate not within 1
-                return true;
-            } else {
-                // Also check if the y coordinates check out
-                if(!(y1 >= (prev_y1 - 1)) || !(y1 <= (prev_y2 + 1))) {
-                    return true;
-                }
-            }
-        }
-    }
-
-    if(prev_type == "CHANX" || prev_type == "CHANY") {
-        if(curr_type == "OPIN") return true;
-    }
-
-    if(prev_type == "CHANX" || prev_type == "CHANY") {
-        if(curr_type == "OPIN") return true;
-    }
-
-    if(prev_type == "SINK" && (curr_type == "IPIN" || curr_type == "SINK"))
+    // If it's part of a non configurable node list, return true
+    if (rr_graph.num_non_configurable_edges(node) != 0) {
         return true;
+    }
 
     return false;
 }
